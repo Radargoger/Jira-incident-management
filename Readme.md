@@ -7,8 +7,10 @@ Seamlessly sync threat intelligence alarms from SOCRadar into Jira with bi-direc
 ## How It Works
 
 - **Automated Polling:** Checks for new alarms every **5 minutes** via Forge scheduled trigger.
-- **Bi-Directional Sync:** SOCRadar status changes update Jira issues; Jira status changes update SOCRadar alarms.
-- **Safe Formatting:** Alarm data is formatted into ADF tables. Fields over 4,500 chars are truncated with a link to view full details on SOCRadar.
+- **Reverse Pagination:** API returns newest alarms on page 1, oldest on last page. The poller fetches from the last page backwards to process alarms in chronological order (oldest → newest).
+- **Cursor-Based Resume:** Forge has a 25s execution limit. Each trigger processes pages within a **20s time budget**, saves a cursor, and resumes from where it left off on the next trigger.
+- **Directional Sync:** Jira status changes update SOCRadar alarms.
+- **Safe Formatting:** Alarm data is formatted into ADF tables. Text fields over 4,500 chars are truncated with a link to view full details on SOCRadar.
 - **Issue Panel:** Each SOCRadar-linked issue shows live alarm details directly in Jira.
 
 ---
@@ -59,40 +61,74 @@ Assign issues by alarm type. **Sub-type rules take priority** over main-type rul
 
 ### Time Window
 
+Each poll calculates a time window using epoch timestamps:
+
 ```
-start = lastPollEpoch - 120s (safety buffer)
-end   = now
+start = lastPollEpoch - 120s   (2-minute safety buffer to prevent missed alarms)
+end   = now (epoch)
 ```
+
+If `lastPollEpoch` is not set (first run), the start defaults to `now - pollingInterval`.
+
+A **max lookback cap** of `2 × pollingInterval` prevents runaway historical polling if a previous sync never completed.
 
 ### API Behavior
 
-Base URL: `https://platform.socradar.com/api/company/{id}/incidents/v4`
-
-The API returns **newest alarms on page 1**, oldest on the last page. Each page holds up to 100 alarms.
+| Detail | Value |
+|--------|-------|
+| Base URL | `https://platform.socradar.com/api/company/{id}/incidents/v4` |
+| Page size | 20 alarms per page (configurable, max 100) |
+| Sort order | **Newest on page 1**, oldest on last page |
+| Pagination metadata | Returned when `include_total_records=true` (`total_pages`, `total_records`) |
 
 ### Reverse Pagination Strategy
 
-```
-500 alarms → 5 pages
-
-Process order: Page 5 → 4 → 3 → 2 → 1 (oldest → newest)
-```
-
-1. Fetch page 1 with `include_total_records=true` → get `total_pages`.
-2. Start from the **last page**, work backwards to page 1.
-3. This ensures chronological processing (oldest first).
-
-### Forge Runtime Handling
-
-Forge has a 25s execution limit, so each trigger uses a **20s time budget**:
+Since the API returns newest alarms first and oldest last, alarms must be processed in reverse page order to maintain chronological order:
 
 ```
-Trigger 1: Pages 25 → 18 (time up) → save cursor = 17
-Trigger 2: Pages 17 → 10           → save cursor = 9
-Trigger 3: Pages 9 → 1             → poll complete, clear cursor
+Example: 500 alarms in time window → 25 pages (at 20/page)
+
+Page 1:  alarms 481-500 (newest)
+Page 2:  alarms 461-480
+...
+Page 25: alarms 1-20   (oldest)
+
+Process order: Page 25 → 24 → 23 → ... → 1 (oldest → newest)
 ```
 
-Max lookback is capped at 2× polling interval to prevent runaway historical polling.
+**Steps:**
+
+1. Fetch page 1 with `include_total_records=true` → get `total_pages` and `total_records`.
+2. Set cursor to `total_pages` (last page).
+3. Process pages from last → first (reverse order).
+4. This ensures Jira issues are created in chronological order.
+
+### Forge Runtime Handling (Cursor-Based Resume)
+
+Forge scheduled triggers have a **25-second execution limit**. The poller uses a **20-second time budget** per trigger and persists progress via a cursor:
+
+```
+Trigger 1: Discover 25 pages → process pages 25 → 18 (time up) → save cursor = 17
+Trigger 2: Resume from cursor → process pages 17 → 10 (time up) → save cursor = 9
+Trigger 3: Resume from cursor → process pages 9 → 1 → poll complete, clear cursor
+```
+
+**Cursor state is persisted in Forge storage:**
+
+| Field | Purpose |
+|-------|---------|
+| `pollCursor` | Next page to process |
+| `pollStartEpoch` | Frozen start of time window |
+| `pollEndEpoch` | Frozen end of time window |
+| `pollTotalPages` | Total pages discovered |
+
+When the cursor is active, the time window is **frozen** — subsequent triggers do not recalculate start/end, ensuring no alarms are skipped or duplicated.
+
+### Concurrency Guard
+
+A `isRunning` flag prevents overlapping executions. If a trigger finds `isRunning = true`, it skips. The flag is cleared after each page-processing cycle (not only on full completion), so the next scheduled trigger can resume.
+
+> **Stuck state:** If a run crashes without clearing `isRunning`, use the **Reset Sync** button in the admin UI.
 
 ---
 
@@ -109,7 +145,20 @@ Max lookback is capped at 2× polling interval to prevent runaway historical pol
 
 ### Key Query Parameters (Fetch Alarms)
 
-`page`, `limit` (max 100), `start_date` (epoch), `end_date` (epoch), `status`, `severities`, `alarm_main_types[]`, `tags[]`, `assignees[]`, `include_total_records`, `include_alarm_details`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `page` | integer | Page number (default: 1) |
+| `limit` | integer | Results per page (default: 20, max: 100) |
+| `start_date` | epoch/date | Filter from date |
+| `end_date` | epoch/date | Filter to date |
+| `status` | string | Filter by status |
+| `severities` | string | Filter by severity (LOW, MEDIUM, HIGH, CRITICAL) |
+| `alarm_main_types[]` | array | Filter by main alarm type |
+| `alarm_sub_types[]` | array | Filter by sub alarm type |
+| `tags[]` | array | Filter by tags |
+| `assignees[]` | array | Filter by assignees |
+| `include_total_records` | boolean | Include `total_pages` and `total_records` in response |
+| `include_alarm_details` | boolean | Include alarm type details in response |
 
 ---
 
@@ -149,3 +198,4 @@ Max lookback is capped at 2× polling interval to prevent runaway historical pol
 | "Previous run active" | Use **Reset Sync** to clear the stuck `isRunning` flag |
 | Alarms missed | 120s buffer should prevent this; check if filters are too restrictive |
 | Reverse sync not working | Issue must be in alarm index (created by this app, not manually) + User Email must be set |
+| Pages remaining after trigger | Normal behavior — cursor will resume on next 5-minute trigger |
